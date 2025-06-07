@@ -8,6 +8,8 @@ import com.griddynamics.esgraduationproject.model.TypeaheadServiceRequest;
 import com.griddynamics.esgraduationproject.model.TypeaheadServiceResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.elasticsearch.action.DocWriteRequest;
+import org.elasticsearch.action.admin.indices.alias.IndicesAliasesRequest;
+import org.elasticsearch.action.admin.indices.alias.get.GetAliasesRequest;
 import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
 import org.elasticsearch.action.bulk.BulkRequest;
@@ -16,11 +18,13 @@ import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
+import org.elasticsearch.client.GetAliasesResponse;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.RestHighLevelClient;
 import org.elasticsearch.client.indices.CreateIndexRequest;
 import org.elasticsearch.client.indices.CreateIndexResponse;
 import org.elasticsearch.client.indices.GetIndexRequest;
+import org.elasticsearch.client.indices.GetIndexResponse;
 import org.elasticsearch.common.xcontent.XContentType;
 import org.elasticsearch.index.query.BoolQueryBuilder;
 import org.elasticsearch.index.query.DisMaxQueryBuilder;
@@ -46,12 +50,16 @@ import org.springframework.stereotype.Component;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.apache.commons.lang3.StringUtils.isNotEmpty;
@@ -258,20 +266,70 @@ public class TypeaheadRepositoryImpl implements TypeaheadRepository {
 
     @Override
     public void recreateIndex() {
-        if (indexExists(indexName)) {
-            deleteIndex(indexName);
-        }
+//
+//        String settings = getStrFromResource(typeaheadsSettingsFile);
+//        String mappings = getStrFromResource(typeaheadsMappingsFile);
+//        createIndex(indexName, settings, mappings);
+//
+//        processBulkInsertData(typeaheadsBulkInsertDataFile);
+//        try {
+//            RefreshRequest refreshRequest = new RefreshRequest(indexName);
+//            esClient.indices().refresh(refreshRequest, RequestOptions.DEFAULT);
+//        } catch (IOException e) {
+//            throw new RuntimeException("Failed to refresh index after bulk insert", e);
+//        }
+        String timestamp = new SimpleDateFormat("yyyyMMddHHmmss").format(new Date());
+        String newIndexName = indexName + "_" + timestamp;
 
         String settings = getStrFromResource(typeaheadsSettingsFile);
         String mappings = getStrFromResource(typeaheadsMappingsFile);
-        createIndex(indexName, settings, mappings);
+        createIndex(newIndexName, settings, mappings);
 
-        processBulkInsertData(typeaheadsBulkInsertDataFile);
+        processBulkInsertData(typeaheadsBulkInsertDataFile, newIndexName);
+
         try {
-            RefreshRequest refreshRequest = new RefreshRequest(indexName);
-            esClient.indices().refresh(refreshRequest, RequestOptions.DEFAULT);
+            esClient.indices().refresh(new RefreshRequest(newIndexName), RequestOptions.DEFAULT);
         } catch (IOException e) {
             throw new RuntimeException("Failed to refresh index after bulk insert", e);
+        }
+
+        try {
+            GetAliasesRequest request = new GetAliasesRequest(indexName);
+            GetAliasesResponse response = esClient.indices().getAlias(request, RequestOptions.DEFAULT);
+
+            List<String> indicesWithAlias = new ArrayList<>(response.getAliases().keySet());
+
+            IndicesAliasesRequest aliasesRequest = new IndicesAliasesRequest();
+            for (String oldIndex : indicesWithAlias) {
+                aliasesRequest.addAliasAction(IndicesAliasesRequest.AliasActions.remove().index(oldIndex).alias(indexName));
+            }
+            aliasesRequest.addAliasAction(IndicesAliasesRequest.AliasActions.add().index(newIndexName).alias(indexName));
+            esClient.indices().updateAliases(aliasesRequest, RequestOptions.DEFAULT);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to switch alias to new index", e);
+        }
+
+        try {
+            GetIndexRequest getIndexRequest = new GetIndexRequest(indexName + "_*");
+            GetIndexResponse getIndexResponse = esClient.indices().get(getIndexRequest, RequestOptions.DEFAULT);
+            String[] allIndices = getIndexResponse.getIndices();
+            Pattern pattern = Pattern.compile(Pattern.quote(indexName) + "_(\\d{14})");
+            List<String> timestampedIndices = new ArrayList<>();
+            for (String idx : allIndices) {
+                Matcher m = pattern.matcher(idx);
+                if (m.matches()) {
+                    timestampedIndices.add(idx);
+                }
+            }
+            timestampedIndices.sort((a, b) -> b.compareTo(a));
+            if (timestampedIndices.size() > 5) {
+                List<String> toDelete = timestampedIndices.subList(5, timestampedIndices.size());
+                for (String idx : toDelete) {
+                    esClient.indices().delete(new DeleteIndexRequest(idx), RequestOptions.DEFAULT);
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to delete old indices", e);
         }
     }
 
@@ -329,7 +387,7 @@ public class TypeaheadRepositoryImpl implements TypeaheadRepository {
         }
     }
 
-    private void processBulkInsertData(Resource bulkInsertDataFile) {
+    private void processBulkInsertData(Resource bulkInsertDataFile, String indexName) {
         int requestCnt = 0;
         try {
             BulkRequest bulkRequest = new BulkRequest();
@@ -340,7 +398,7 @@ public class TypeaheadRepositoryImpl implements TypeaheadRepository {
                 if (isNotEmpty(line1) && br.ready()) {
                     requestCnt++;
                     String line2 = br.readLine();
-                    IndexRequest indexRequest = createIndexRequestFromBulkData(line1, line2);
+                    IndexRequest indexRequest = createIndexRequestFromBulkData(line1, line2, indexName);
                     if (indexRequest != null) {
                         bulkRequest.add(indexRequest);
                     }
@@ -363,9 +421,9 @@ public class TypeaheadRepositoryImpl implements TypeaheadRepository {
         }
     }
 
-    private IndexRequest createIndexRequestFromBulkData(String line1, String line2) {
+    private IndexRequest createIndexRequestFromBulkData(String line1, String line2, String indexName) {
         DocWriteRequest.OpType opType = null;
-        String esIndexName = null;
+        String esIndexName = indexName;
         String esId = null;
         boolean isOk = true;
 
@@ -391,7 +449,7 @@ public class TypeaheadRepositoryImpl implements TypeaheadRepository {
         }
 
         if (isOk) {
-            return new IndexRequest(esIndexName)
+            return new IndexRequest(indexName)
                 .id(esId)
                 .opType(opType)
                 .source(line2, XContentType.JSON);
